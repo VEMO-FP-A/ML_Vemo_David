@@ -1,0 +1,13 @@
+datos/
+juntas/
+salidas/
+__pycache__/
+*.pyc
+*TOKEN*
+*token*
+github_config.json
+*.xlsx
+*.xlsm
+*.pptx
+*.json
+*.md.bak
