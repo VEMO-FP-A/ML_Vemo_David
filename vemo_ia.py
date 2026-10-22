@@ -29,6 +29,7 @@ import re
 import sys
 import time
 import unicodedata
+import urllib.parse
 from collections import Counter, defaultdict
 
 
@@ -3347,6 +3348,336 @@ def history_md(co, per, cur_rows=None):
 # Dynamics (DB.xlsx: pólizas del mayor) -> qué movimientos hay detrás de cada renglón del Board View
 # ====================================================================================================
 
+# ----------------------------------------------------------------------------------------------------
+# Dynamics 365 Business Central por API (OData V4). El secreto NUNCA va a OneDrive ni al repo:
+# se guarda en el Administrador de credenciales de Windows (o en ~/.vemo_ia fuera de OneDrive).
+# ----------------------------------------------------------------------------------------------------
+
+BC_DEFAULT = {"tenant": "7f4043a9-2a49-4a83-a6a7-56fcf6fa8d04", "entorno": "Production",
+              "empresa": "MOBILITY DAE PRODUCCION", "endpoint": "Movs_contabilidad_Excel"}
+BC_SCOPE = "https://api.businesscentral.dynamics.com/.default"
+BC_FIELDS = {  # nombre lógico -> nombres posibles en la API / en el Excel
+    "date": ("Posting_Date", "PostingDate", "postingDate"),
+    "acct": ("G_L_Account_No", "GLAccountNo", "accountNumber", "G_L_Account_No_"),
+    "name": ("G_L_Account_Name", "GLAccountName", "accountName"),
+    "desc": ("Description", "description"),
+    "amt": ("Amount", "amount"),
+    "doc": ("Document_No", "DocumentNo", "documentNumber"),
+}
+
+
+def _cred_target(name):
+    return f"vemo_ia/{name}"
+
+
+def secret_set(name, value):
+    if os.name == "nt":
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class CRED(ctypes.Structure):
+            _fields_ = [("Flags", wt.DWORD), ("Type", wt.DWORD), ("TargetName", wt.LPWSTR), ("Comment", wt.LPWSTR),
+                        ("LastWritten", wt.FILETIME), ("CredentialBlobSize", wt.DWORD),
+                        ("CredentialBlob", ctypes.POINTER(ctypes.c_char)), ("Persist", wt.DWORD),
+                        ("AttributeCount", wt.DWORD), ("Attributes", ctypes.c_void_p), ("TargetAlias", wt.LPWSTR),
+                        ("UserName", wt.LPWSTR)]
+        blob = value.encode("utf-8")
+        c = CRED()
+        c.Type, c.Persist = 1, 2  # GENERIC, LOCAL_MACHINE (solo este usuario de Windows)
+        c.TargetName, c.UserName = _cred_target(name), "vemo_ia"
+        c.CredentialBlobSize = len(blob)
+        c.CredentialBlob = ctypes.cast(ctypes.create_string_buffer(blob, len(blob)), ctypes.POINTER(ctypes.c_char))
+        if not ctypes.windll.advapi32.CredWriteW(ctypes.byref(c), 0):
+            raise OSError("no pude guardar la credencial en Windows")
+        return
+    d = os.path.join(os.path.expanduser("~"), ".vemo_ia")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, name)
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write(value)
+    os.chmod(p, 0o600)
+
+
+def secret_get(name):
+    env = os.environ.get("VEMO_BC_" + name.upper())
+    if env:
+        return env
+    if os.name == "nt":
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class CRED(ctypes.Structure):
+            _fields_ = [("Flags", wt.DWORD), ("Type", wt.DWORD), ("TargetName", wt.LPWSTR), ("Comment", wt.LPWSTR),
+                        ("LastWritten", wt.FILETIME), ("CredentialBlobSize", wt.DWORD),
+                        ("CredentialBlob", ctypes.POINTER(ctypes.c_char)), ("Persist", wt.DWORD),
+                        ("AttributeCount", wt.DWORD), ("Attributes", ctypes.c_void_p), ("TargetAlias", wt.LPWSTR),
+                        ("UserName", wt.LPWSTR)]
+        p = ctypes.POINTER(CRED)()
+        if not ctypes.windll.advapi32.CredReadW(_cred_target(name), 1, 0, ctypes.byref(p)):
+            return None
+        try:
+            return ctypes.string_at(p.contents.CredentialBlob, p.contents.CredentialBlobSize).decode("utf-8")
+        finally:
+            ctypes.windll.advapi32.CredFree(p)
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".vemo_ia", name), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def dyn_api_cfg(company="DAE"):
+    try:
+        with open(os.path.join(KNOWLEDGE_DIR, "dynamics_api.json"), encoding="utf-8") as fh:
+            cfg = json.load(fh).get(company)
+        return cfg if cfg and cfg.get("activo") else None
+    except Exception:
+        return None
+
+
+def _http(url, data=None, headers=None, timeout=90, retries=4):
+    import urllib.error
+    import urllib.request
+    body = urllib.parse.urlencode(data).encode() if isinstance(data, dict) else data
+    for i in range(retries):
+        req = urllib.request.Request(url, data=body, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            txt = e.read().decode("utf-8", "ignore")[:400]
+            if e.code in (429, 500, 502, 503, 504) and i < retries - 1:
+                time.sleep(int(e.headers.get("Retry-After") or 2 ** (i + 1)))
+                continue
+            try:
+                j = json.loads(txt)
+                err = j.get("error")
+                msg = j.get("error_description") or (err.get("message") if isinstance(err, dict) else err) or txt
+            except Exception:
+                msg = txt
+            raise RuntimeError(f"HTTP {e.code}: {msg}") from None
+        except urllib.error.URLError as e:
+            if i < retries - 1:
+                time.sleep(2 ** (i + 1))
+                continue
+            raise RuntimeError(f"sin conexión con {urllib.parse.urlparse(url).netloc}: {e.reason}") from None
+
+
+class BCClient:
+    """Cliente mínimo de Business Central (OData V4): token de Entra ID + paginación @odata.nextLink."""
+
+    def __init__(self, cfg):
+        self.cfg = {**BC_DEFAULT, **cfg}
+        self._tok, self._exp = None, 0
+        self.login = self.cfg.get("login_url") or f"https://login.microsoftonline.com/{self.cfg['tenant']}/oauth2/v2.0"
+        base = self.cfg.get("api_base") or "https://api.businesscentral.dynamics.com/v2.0"
+        comp = urllib.parse.quote(self.cfg["empresa"], safe="")
+        self.url = f"{base}/{self.cfg['tenant']}/{self.cfg['entorno']}/ODataV4/Company('{comp}')/{self.cfg['endpoint']}"
+
+    def token(self):
+        if self._tok and time.time() < self._exp - 120:
+            return self._tok
+        c = self.cfg
+        if c.get("auth", "client_credentials") == "client_credentials":
+            sec = secret_get("client_secret")
+            if not sec:
+                raise RuntimeError("falta el secreto de la app (corre: vemo_ia.py dynamics --configurar)")
+            j = _http(f"{self.login}/token", {"grant_type": "client_credentials", "client_id": c["client_id"],
+                                               "client_secret": sec, "scope": BC_SCOPE})
+        else:
+            rt = secret_get("refresh_token")
+            if not rt:
+                raise RuntimeError("no hay sesión iniciada (corre: vemo_ia.py dynamics --configurar)")
+            j = _http(f"{self.login}/token", {"grant_type": "refresh_token", "client_id": c["client_id"],
+                                               "refresh_token": rt, "scope": BC_SCOPE + " offline_access"})
+            if j.get("refresh_token"):
+                secret_set("refresh_token", j["refresh_token"])
+        self._tok, self._exp = j["access_token"], time.time() + int(j.get("expires_in", 3600))
+        return self._tok
+
+    def device_login(self):
+        c = self.cfg
+        j = _http(f"{self.login}/devicecode", {"client_id": c["client_id"], "scope": BC_SCOPE + " offline_access"})
+        print("\n" + j.get("message", f"Entra a {j['verification_uri']} y escribe el código {j['user_code']}"))
+        t0, wait = time.time(), int(j.get("interval", 5))
+        while time.time() - t0 < int(j.get("expires_in", 900)):
+            time.sleep(wait)
+            try:
+                tok = _http(f"{self.login}/token", {"grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                                                     "client_id": c["client_id"], "device_code": j["device_code"]}, retries=1)
+            except RuntimeError as e:
+                if "authorization_pending" in str(e) or "AADSTS70016" in str(e) or "pending" in str(e).lower():
+                    continue
+                if "slow_down" in str(e):
+                    wait += 5
+                    continue
+                raise
+            secret_set("refresh_token", tok["refresh_token"])
+            return True
+        raise RuntimeError("se venció el código sin iniciar sesión")
+
+    def rows(self, flt=None, select=None, top=None):
+        q = {}
+        if flt:
+            q["$filter"] = flt
+        if select:
+            q["$select"] = select
+        if top:
+            q["$top"] = str(top)
+        url = self.url + ("?" + urllib.parse.urlencode(q, quote_via=urllib.parse.quote) if q else "")
+        while url:
+            j = _http(url, headers={"Authorization": f"Bearer {self.token()}", "Accept": "application/json",
+                                    "Prefer": "odata.maxpagesize=20000"})
+            yield from j.get("value", [])
+            url = j.get("@odata.nextLink")
+
+
+def _f(r, k):
+    for n in BC_FIELDS[k]:
+        if n in r:
+            return r[n]
+    return None
+
+
+def _dyn_agg(rows, mp, agg=None):
+    """Agrega pólizas (dicts) por renglón del Board y mes. Signo del Board: ingreso +, gasto −."""
+    A = agg or {"tot": {}, "acc": {}, "top": {}, "cnt": {}, "unm": Counter(), "ultimo": ""}
+    for r in rows:
+        a = str(_f(r, "acct") or "").strip()
+        if not a or a[:1] not in "4567":
+            continue
+        d = _f(r, "date")
+        ds = d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)[:10]
+        ym = ds[:7]
+        try:
+            amt = -float(_f(r, "amt") or 0)
+        except (TypeError, ValueError):
+            continue
+        line = mp.get(a)
+        if not line:
+            A["unm"][a] += 1
+            continue
+        key = f"{'|'.join(line)}#{ym}"
+        A["tot"][key] = A["tot"].get(key, 0.0) + amt
+        A["cnt"][key] = A["cnt"].get(key, 0) + 1
+        an = str(_f(r, "name") or a).strip()
+        A["acc"].setdefault(key, {})
+        A["acc"][key][an] = A["acc"][key].get(an, 0.0) + amt
+        desc = re.sub(r"\s+", " ", str(_f(r, "desc") or an)).strip()[:90]
+        x = A["top"].setdefault(key, {}).setdefault(desc, [0.0, an, ds, str(_f(r, "doc") or ""), 0])
+        x[0] += amt
+        x[4] += 1
+        A["ultimo"] = max(A["ultimo"], ds)
+    return A
+
+
+def _dyn_finish(A):
+    top = {k: [[round(v[0], 2), dsc, v[1], v[2], v[3], v[4]] for dsc, v in
+               sorted(t.items(), key=lambda it: -abs(it[1][0])) if abs(v[0]) >= 1000][:8] for k, t in A["top"].items()}
+    return {"totales": A["tot"], "cuentas": A["acc"], "top": top, "n": A["cnt"], "sin_mapeo": len(A["unm"]),
+            "ultimo_mov": A["ultimo"], "meses": sorted({k.split("#")[1] for k in A["tot"]})}
+
+
+def _next_month(ym):
+    y, m = int(ym[:4]), int(ym[5:7]) + 1
+    return f"{y + (m > 12):04d}-{(m - 1) % 12 + 1:02d}"
+
+
+def dyn_api_fetch(cfg, mp, months, verbose=True):
+    """Trae de la API las pólizas de `months` (YYYY-MM) y las agrega. Un mes por llamada (filtro por fecha)."""
+    cli = BCClient(cfg)
+    A = None
+    sel = ",".join(BC_FIELDS[k][0] for k in ("date", "acct", "name", "desc", "amt", "doc"))
+    for ym in months:
+        flt = f"Posting_Date ge {ym}-01 and Posting_Date lt {_next_month(ym)}-01"
+        try:
+            rows = list(cli.rows(flt, sel))
+        except RuntimeError as e:
+            if "HTTP 400" in str(e):  # el servicio no acepta $select con esos nombres: sin $select
+                rows = list(cli.rows(flt))
+            else:
+                raise
+        A = _dyn_agg(rows, mp, A)
+        if verbose:
+            print(f"    {ym}: {len(rows):,} pólizas", flush=True)
+    return A or _dyn_agg([], mp)
+
+
+def _dyn_merge(old, new, months):
+    """Reemplaza en `old` los meses `months` con lo de `new`."""
+    out = {k: dict(old.get(k) or {}) for k in ("totales", "cuentas", "top", "n")}
+    for k in out:
+        for key in [x for x in out[k] if x.split("#")[1] in months]:
+            out[k].pop(key)
+        out[k].update(new.get(k) or {})
+    out["meses"] = sorted({k.split("#")[1] for k in out["totales"]})
+    out["ultimo_mov"] = max(old.get("ultimo_mov") or "", new.get("ultimo_mov") or "")
+    out["sin_mapeo"] = new.get("sin_mapeo", 0)
+    return out
+
+
+def dyn_api_configurar(company="DAE"):
+    """Asistente: guarda la conexión en datos/dynamics_api.json (sin secretos) y el secreto en Windows."""
+    p = os.path.join(KNOWLEDGE_DIR, "dynamics_api.json")
+    try:
+        with open(p, encoding="utf-8") as fh:
+            allc = json.load(fh)
+    except Exception:
+        allc = {}
+    cfg = {**BC_DEFAULT, **(allc.get(company) or {})}
+    print("\nConexión a Dynamics 365 Business Central (API). Enter = dejar lo que está entre [].")
+    link = input("Pega el link de la API (o Enter) : ").strip()
+    m = re.search(r"/v2\.0/([0-9a-f-]{36})/([^/]+)/ODataV4/Company\('([^']+)'\)/([^/?]+)", urllib.parse.unquote(link))
+    if m:
+        cfg.update(tenant=m.group(1), entorno=m.group(2), empresa=m.group(3), endpoint=m.group(4))
+    print(f"  Tenant {cfg['tenant']} · {cfg['entorno']} · {cfg['empresa']} · {cfg['endpoint']}")
+    print("  Tipo de acceso:\n   1) App de Entra ID con secreto (TI te da Client ID y Secret)  [recomendado]\n"
+          "   2) Iniciar sesión con tu cuenta de Microsoft (TI te da el Client ID de una app pública)")
+    op = input(f"  Opción [{1 if cfg.get('auth', 'client_credentials') == 'client_credentials' else 2}]: ").strip()
+    cfg["auth"] = "device_code" if op == "2" or (not op and cfg.get("auth") == "device_code") else "client_credentials"
+    cid = input(f"  Client ID [{cfg.get('client_id', '')}]: ").strip()
+    if cid:
+        cfg["client_id"] = cid
+    if not cfg.get("client_id"):
+        print("  Sin Client ID no puedo conectarme. Pídeselo a TI (ver README) y vuelve a correr esto.")
+        return False
+    if cfg["auth"] == "client_credentials":
+        import getpass
+        sec = getpass.getpass("  Client Secret (no se muestra; Enter = conservar el guardado): ").strip()
+        if sec:
+            secret_set("client_secret", sec)
+    sa = input(f"  ¿Usar SOLO la API (no leer DB.xlsx)? s/n [{'s' if cfg.get('solo_api', True) else 'n'}]: ").strip().lower()
+    cfg["solo_api"] = (sa != "n") if sa else cfg.get("solo_api", True)
+    cfg["activo"] = True
+    allc[company] = {k: v for k, v in cfg.items() if k not in ("login_url", "api_base") or v}
+    os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(allc, fh, ensure_ascii=False, indent=1)
+    if cfg["auth"] == "device_code":
+        BCClient(cfg).device_login()
+    return dyn_api_probar(company)
+
+
+def dyn_api_probar(company="DAE"):
+    cfg = dyn_api_cfg(company)
+    if not cfg:
+        print("  Dynamics API no configurada (vemo_ia.py dynamics --configurar).")
+        return False
+    try:
+        cli = BCClient(cfg)
+        r = next(cli.rows(top=1), None)
+    except Exception as e:
+        print(f"  ✗ No pude conectarme: {e}")
+        return False
+    if r is None:
+        print("  ✓ Conectado, pero el servicio no regresó pólizas.")
+        return True
+    falt = [k for k in BC_FIELDS if _f(r, k) is None and k not in ("doc",)]
+    print(f"  ✓ Conectado a {cfg.get('empresa', BC_DEFAULT['empresa'])}: {len(r)} campos por póliza"
+          + (f"; OJO, no encuentro: {', '.join(falt)}" if falt else "; campos completos."))
+    return not falt
+
+
 def dyn_db_path(fy_path):
     """El DB.xlsx que extraes de Dynamics, en la carpeta del FY Financials (p. ej. '13. DB Dynamics/DB.xlsx')."""
     base = os.path.dirname(fy_path)
@@ -3379,77 +3710,90 @@ def dyn_mapping(wb):
             continue
         g = lambda i: (str(row[i]).strip() if i is not None and i < len(row) and row[i] not in (None, "n.a.") else "")
         if g(cols[2]):
-            mp[str(a).strip()] = (g(cols[1]), g(cols[2]), g(cols[3]), g(cols[4]))
+            new = (g(cols[1]), g(cols[2]), g(cols[3]), g(cols[4]))
+            key = str(a).strip()
+            spec = lambda t: sum(1 for x in t[2:] if x and _plain(x) != _plain(t[1]))  # sub-renglón más específico
+            if key not in mp or spec(new) > spec(mp[key]):  # la cuenta viene repetida: me quedo con el mapeo más fino
+                mp[key] = new
     return mp
 
 
-def dyn_build(root, company="DAE", verbose=True):
+def dyn_build(root, company="DAE", verbose=True, force=False):
     """datos/dynamics_<CO>.json: por renglón del Board y mes, total, desglose por cuenta y movimientos más grandes.
-    Se recalcula solo si cambió DB.xlsx o el FY Financials."""
+    Fuente: la API de Business Central si está configurada (incremental: refresca los últimos meses);
+    si no, el DB.xlsx que exportas. Con 'solo_api' nunca usa el Excel."""
     import openpyxl
     fy = fy_file(root, company, _dt.date.today().year)
-    db = dyn_db_path(fy) if fy else None
-    out_p = os.path.join(KNOWLEDGE_DIR, f"dynamics_{company}.json")
-    if not db:
+    if not fy:
         return None
-    sig = ["v2", os.path.basename(db), int(os.path.getmtime(db)), int(os.path.getmtime(fy))]
+    out_p = os.path.join(KNOWLEDGE_DIR, f"dynamics_{company}.json")
     try:
         with open(out_p, encoding="utf-8") as fh:
             old = json.load(fh)
-        if old.get("sig") == sig:
-            return old
     except Exception:
-        pass
+        old = None
+    cfg = dyn_api_cfg(company)
+    fy_mt = int(os.path.getmtime(fy))
+    if cfg:
+        if old and old.get("fuente") == "api" and old.get("fy_mtime") == fy_mt and not force:
+            age = time.time() - old.get("ts", 0)
+            if age < 30 * 60:  # menos de 30 min: no vuelvo a pedir
+                return old
+        mp = dyn_mapping(openpyxl.load_workbook(fy, read_only=True, data_only=True))
+        today = _dt.date.today()
+        cur = f"{today.year:04d}-{today.month:02d}"
+        full = not (old and old.get("fuente") == "api" and old.get("fy_mtime") == fy_mt)
+        start = _prev(f"{today.year:04d}-01") if full else _prev(_prev(cur))  # completo: desde diciembre del año pasado
+        months, m = [], start
+        while m <= cur:
+            months.append(m)
+            m = _next_month(m)
+        try:
+            if verbose:
+                print(f"  Dynamics API: {'carga completa' if full else 'actualizo'} {months[0]}..{months[-1]} ...", flush=True)
+            new = _dyn_finish(dyn_api_fetch(cfg, mp, months, verbose=verbose))
+            data = new if full else _dyn_merge(old, new, months)
+            data.update(fuente="api", db=f"API {cfg.get('empresa', BC_DEFAULT['empresa'])}", fy_mtime=fy_mt, ts=time.time(),
+                        actualizado=_dt.datetime.now().strftime("%Y-%m-%d %H:%M"))
+            with open(out_p, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False)
+            if verbose:
+                print(f"  Dynamics API: {sum(data['n'].values()):,} pólizas de P&L, {data['meses'][0]}..{data['meses'][-1]}, "
+                      f"último movimiento {data['ultimo_mov']}", flush=True)
+            return data
+        except Exception as e:
+            msg = f"Dynamics API falló ({e})"
+            if cfg.get("solo_api", True):
+                if verbose:
+                    print(f"  {msg}; uso lo último que bajé" + (f" ({old.get('actualizado')})" if old else " (no hay nada guardado)"))
+                if old:
+                    old["aviso"] = msg
+                return old
+            if verbose:
+                print(f"  {msg}; uso DB.xlsx")
+    db = dyn_db_path(fy)
+    if not db:
+        return old
+    sig = ["v3", os.path.basename(db), int(os.path.getmtime(db)), fy_mt]
+    if old and old.get("sig") == sig and not force:
+        return old
     if verbose:
         print(f"  Leyendo Dynamics ({os.path.basename(db)}) ...", flush=True)
     mp = dyn_mapping(openpyxl.load_workbook(fy, read_only=True, data_only=True))
     wb = openpyxl.load_workbook(db, read_only=True, data_only=True)
-    ws = wb.worksheets[0]
-    it = ws.iter_rows(values_only=True)
+    it = wb.worksheets[0].iter_rows(values_only=True)
     hdr = [str(h) if h is not None else "" for h in next(it)]
-    ix = {h: i for i, h in enumerate(hdr)}
-    need = ("Posting_Date", "G_L_Account_No", "G_L_Account_Name", "Description", "Amount")
-    if not all(k in ix for k in need):
-        return None
-    tot, acc, top, cnt, unm = {}, {}, {}, {}, Counter()
-    g = lambda r, k: r[ix[k]] if k in ix and ix[k] < len(r) else None
-    for r in it:
-        a = str(g(r, "G_L_Account_No") or "").strip()
-        if not a or a[:1] not in "4567":
-            continue
-        d = g(r, "Posting_Date")
-        ym = f"{d.year:04d}-{d.month:02d}" if hasattr(d, "year") else str(d)[:7]
-        try:
-            amt = -float(g(r, "Amount") or 0)  # signo del Board: ingreso +, gasto −
-        except (TypeError, ValueError):
-            continue
-        line = mp.get(a)
-        if not line:
-            unm[a] += 1
-            continue
-        k = "|".join(line)
-        key = f"{k}#{ym}"
-        tot[key] = tot.get(key, 0.0) + amt
-        cnt[key] = cnt.get(key, 0) + 1
-        an = str(g(r, "G_L_Account_Name") or a).strip()
-        acc.setdefault(key, {})
-        acc[key][an] = acc[key].get(an, 0.0) + amt
-        desc = re.sub(r"\s+", " ", str(g(r, "Description") or an)).strip()[:90]
-        t = top.setdefault(key, {})  # misma descripción = un solo movimiento (las reversas se netean)
-        x = t.setdefault(desc, [0.0, an, str(d)[:10], str(g(r, "Document_No") or ""), 0])
-        x[0] += amt
-        x[4] += 1
-    for k in top:
-        top[k] = [[round(v[0], 2), dsc, v[1], v[2], v[3], v[4]] for dsc, v in
-                  sorted(top[k].items(), key=lambda t: -abs(t[1][0])) if abs(v[0]) >= 1000][:8]
-    out = {"sig": sig, "db": os.path.relpath(db, root).replace("\\", "/"), "totales": tot, "cuentas": acc, "top": top,
-           "n": cnt, "meses": sorted({k.split("#")[1] for k in tot}), "sin_mapeo": len(unm)}
+    if not all(any(n in hdr for n in BC_FIELDS[k]) for k in ("date", "acct", "amt")):
+        return old
+    data = _dyn_finish(_dyn_agg((dict(zip(hdr, r)) for r in it), mp))
+    data.update(sig=sig, fuente="excel", db=os.path.relpath(db, root).replace("\\", "/"), fy_mtime=fy_mt, ts=time.time(),
+                actualizado=_dt.datetime.fromtimestamp(os.path.getmtime(db)).strftime("%Y-%m-%d %H:%M"))
     with open(out_p, "w", encoding="utf-8") as fh:
-        json.dump(out, fh, ensure_ascii=False)
+        json.dump(data, fh, ensure_ascii=False)
     if verbose:
-        print(f"  Dynamics: {sum(cnt.values()):,} movimientos de P&L, meses {out['meses'][0]}..{out['meses'][-1]}"
-              + (f", {len(unm)} cuentas sin mapeo en TB DATA BASE" if unm else ""), flush=True)
-    return out
+        print(f"  Dynamics (Excel): {sum(data['n'].values()):,} pólizas de P&L, {data['meses'][0]}..{data['meses'][-1]}"
+              + (f", {data['sin_mapeo']} cuentas sin mapeo en TB DATA BASE" if data["sin_mapeo"] else ""), flush=True)
+    return data
 
 
 def load_dyn(company="DAE"):
@@ -3518,7 +3862,10 @@ def dyn_md(prep, ctx, company="DAE", k=10):
     if not D or per not in D["meses"]:
         return []
     prev = _prev(per)
-    L = ["", f"## Lo que dice Dynamics ({D['db'].split('/')[-1]}, pólizas del mes)", ""]
+    src = "API Business Central" if D.get("fuente") == "api" else D["db"].split("/")[-1]
+    L = ["", f"## Lo que dice Dynamics ({src}, actualizado {D.get('actualizado', 'n.d.')}; último movimiento {D.get('ultimo_mov', 'n.d.')})", ""]
+    if D.get("aviso"):
+        L += [f"_{D['aviso']}: estos datos pueden estar atrasados._", ""]
     shown = 0
     for x in ctx["lineas"]:
         n = x["node"]
@@ -4077,6 +4424,14 @@ def comentar_empresa(root, company, periodo, outdir, estilo="calidad", meetings=
         dyn_build(root, company, verbose=False)
         ctx["dynamics_md"] = dyn_md(prep, ctx, company)
         D = load_dyn(company)
+        if D and prep["period"] in D["meses"]:  # Board vs. Dynamics: diferencias grandes antes de explicar
+            for x in ctx["lineas"][:14]:
+                n = x["node"]
+                cur = dyn_line(D, _dyn_keys(D, n["label"], _ancestors(prep, n)), prep["period"])
+                if cur and cur["n"] and abs((n["m"] or 0) - cur["total"]) >= 0.3e6:
+                    res["flags"].append(f"{x['label']}: el Board {_m(n['m'])} y Dynamics {_m(cur['total'])} difieren por "
+                                        f"{_amt((n['m'] or 0) - cur['total'])} (provisión, reclasificación o ajuste manual); "
+                                        f"confírmalo antes de explicar la variación.")
         if D and prep["period"] in D["meses"]:  # renglón sin nota: lo que muestra Dynamics como pista
             for i, f in enumerate(res["flags"]):
                 if "sin nota" not in f:
@@ -4239,10 +4594,20 @@ def menu():
         print("  2) Preguntar")
         print("  3) Aprender de mis MFR publicados (después de cerrar cada mes)")
         print("  4) Abrir dashboard en el navegador")
-        print("  5) Salir")
+        print("  5) Dynamics (API): configurar / probar / actualizar")
+        print("  6) Salir")
         op = input("Opción [1]: ").strip() or "1"
-        if op == "5":
+        if op == "6":
             return
+        if op == "5":
+            sub = input("  a) configurar  b) probar conexión  c) actualizar ahora [c]: ").strip().lower() or "c"
+            if sub == "a":
+                dyn_api_configurar("DAE")
+            elif sub == "b":
+                dyn_api_probar("DAE")
+            else:
+                dyn_build(root, "DAE", verbose=True, force=True)
+            continue
         if op == "4":
             run_dashboard(root)
             continue
@@ -4370,6 +4735,7 @@ svg text{fill:var(--mute);font-size:11px}
   <div class="seg" id="emp"></div>
   <input type="month" id="mes">
   <button class="btn" id="go">Generar</button>
+  <button class="btn ghost" id="dyn" title="Baja de nuevo las pólizas de Dynamics">Actualizar Dynamics</button>
   <span id="status">Elige empresa y mes.</span>
 </header>
 <main>
@@ -4442,6 +4808,10 @@ async function generar(){const per=$("#mes").value;$("#go").disabled=true;const 
 async function preguntar(){const q=$("#q").value.trim();if(!q)return;$("#qgo").disabled=true;$("#qa-out").innerHTML='<span class="spin"></span>Buscando…';
  try{const r=await fetch(`/api/preguntar?q=${encodeURIComponent(q)}`);const d=await r.json();$("#qa-out").innerHTML=d.error?esc("Error: "+d.error):md(d.respuesta)}
  finally{$("#qgo").disabled=false}}
+$("#dyn").onclick=async()=>{$("#dyn").disabled=true;$("#status").innerHTML='<span class="spin"></span>Actualizando Dynamics…';
+ try{const d=await(await fetch("/api/dynamics")).json();$("#status").textContent=d.error?("Error: "+d.error):
+  (d.aviso?d.aviso:`Dynamics (${d.fuente||"sin fuente"}) actualizado ${d.actualizado||""} · último movimiento ${d.ultimo_mov||"n.d."}`)}
+ finally{$("#dyn").disabled=false}};
 $("#go").onclick=generar;$("#qgo").onclick=preguntar;$("#q").onkeydown=e=>{if(e.key==="Enter")preguntar()};
 fetch("/api/info").then(r=>r.json()).then(d=>{INFO=d;$("#mes").value=d.ultimo;
  $("#emp").innerHTML=d.empresas.map(e=>`<button data-e="${e.code}" class="${e.code===EMP?"on":""}" title="${e.motor?"Comentarios MFR + resumen":"Resumen, histórico y HL/LL"}">${e.code}${e.motor?"":"<small>resumen</small>"}</button>`).join("");
@@ -4491,6 +4861,11 @@ def run_dashboard(root, port=DASH_PORT, open_browser=True):
                         return self._json({"error": "mes inválido (usa AAAA-MM)"}, 400)
                     with lock:  # un cálculo a la vez (abre el Excel)
                         return self._json(dash_generar(root, emp, per, meetings))
+                if u.path == "/api/dynamics":
+                    with lock:
+                        D = dyn_build(root, "DAE", verbose=False, force=True)
+                    return self._json({"fuente": (D or {}).get("fuente"), "actualizado": (D or {}).get("actualizado"),
+                                       "ultimo_mov": (D or {}).get("ultimo_mov"), "aviso": (D or {}).get("aviso")})
                 if u.path == "/api/preguntar":
                     with lock:
                         return self._json({"respuesta": answer_question(root, q.get("q", "")[:300], meetings)})
@@ -4541,6 +4916,10 @@ def main():
     c.add_argument("--periodo", default=None)
     c.add_argument("--estilo", choices=["calidad", "decks"], default="calidad")
     c.add_argument("--aprender", choices=["auto", "si", "no"], default="auto")
+    dy = sub.add_parser("dynamics")
+    dy.add_argument("--configurar", action="store_true")
+    dy.add_argument("--probar", action="store_true")
+    dy.add_argument("--empresa", default="DAE")
     dsh = sub.add_parser("dashboard")
     dsh.add_argument("--puerto", type=int, default=DASH_PORT)
     dsh.add_argument("--sin-navegador", action="store_true")
@@ -4559,6 +4938,13 @@ def main():
         if emp not in EJECUTA:
             sys.exit(f"Por ahora el motor MFR corre solo para {', '.join(EJECUTA)}.")
         run_comentar(root, emp, parse_periodo(args.periodo) if args.periodo else None, args.estilo, args.aprender)
+    elif args.cmd == "dynamics":
+        if args.configurar:
+            dyn_api_configurar(args.empresa.upper())
+        elif args.probar:
+            dyn_api_probar(args.empresa.upper())
+        else:
+            dyn_build(root, args.empresa.upper(), verbose=True, force=True)
     elif args.cmd == "dashboard":
         run_dashboard(root, port=args.puerto, open_browser=not args.sin_navegador)
     elif args.cmd == "preguntar":
